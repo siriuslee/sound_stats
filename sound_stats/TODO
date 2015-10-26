@@ -1,0 +1,33 @@
+Goals:
+
+To develop tools to study the statistics of sounds of different categories
+
+We need to three main parts:
+Input representations
+Embeddings
+Analyses
+
+For input representations:
+Spectrogram
+Cochleagram
+Mel Spectrogram
+MFCC
+
+All should be implemented as their own objects such that they can be easily swapped
+They need the methods:
+load
+save
+compute
+
+For Embeddings:
+Deep network
+Deep convolutional (in time) network
+Deep recurrent network
+
+They need the methods:
+fit
+evaluate
+load
+save
+
+I'd like all compute methods to have a wrapper that submits them to a cluster to run
