@@ -95,6 +95,10 @@ class SoundInput(object):
 
         self._filename = store.filename
 
+    def plot(self, data=None):
+
+        raise NotImplementedError()
+
     def compute(self):
 
         raise NotImplementedError()
@@ -122,9 +126,12 @@ class Spectrogram(SoundInput):
                                                           nstd=nstd)[:3]
         self._cached_data = log_spectrogram(np.abs(spec), offset=offset)
 
-    def plot(self):
+    def plot(self, data=None):
 
-        plt.imshow(self.data,
+        if data is None:
+            data = self.data
+
+        plt.imshow(data,
                    aspect="auto",
                    origin="lower",
                    extent=[self.time[0], self.time[-1],
@@ -132,6 +139,58 @@ class Spectrogram(SoundInput):
         plt.xlabel("Time (s)")
         plt.ylabel("Frequency (Hz)")
         plt.title("Log spectrogram")
+
+class MeanCenterSpectrogram(Spectrogram):
+
+    _data_name = "mean_centered_spectrogram"
+    _save_attrs = ["frequencies", "time", "mean", "global_sub"]
+
+    def __init__(self, *args, **kwargs):
+
+        self.global_sub = kwargs.get("global_sub", False)
+        self.mean = None
+        super(MeanCenterSpectrogram, self).__init__(*args, **kwargs)
+
+    def compute(self, *args, **kwargs):
+
+        super(MeanCenterSpectrogram, self).compute(*args, **kwargs)
+        data = self.data
+        self.mean = np.mean(data, axis=1)
+        self._cached_data = (data - self.mean)
+
+class RatioMask(SoundInput):
+
+    _data_name = "ratio_mask"
+    _save_attrs = ["frequencies", "time", "alpha"]
+
+    def __init__(self, *args, **kwargs):
+
+        self.alpha = kwargs.get("alpha", 1.0)
+        self.frequencies = None
+        self.time = None
+        super(RatioMask, self).__init__(*args, **kwargs)
+
+    def compute(self, signal, window_length, increment, min_freq=0, max_freq=None, nstd=6):
+
+        signal = np.asarray(signal).squeeze()
+        noise = np.asarray(self.sound).squeeze() - signal
+
+        self.time, self.frequencies, spec = gaussian_stft(signal,
+                                                          self.sound.samplerate,
+                                                          window_length,
+                                                          increment,
+                                                          min_freq=min_freq,
+                                                          max_freq=max_freq,
+                                                          nstd=nstd)[:3]
+        noise_spec = gaussian_stft(noise,
+                                   self.sound.samplerate,
+                                   window_length,
+                                   increment,
+                                   min_freq=min_freq,
+                                   max_freq=max_freq,
+                                   nstd=nstd)[2]
+
+        self._cached_data = np.abs(spec) ** self.alpha / (np.abs(spec) ** self.alpha + np.abs(noise_spec) ** self.alpha)
 
 
 class Cochleagram(SoundInput):
