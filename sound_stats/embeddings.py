@@ -1,5 +1,6 @@
 import h5py
 import logging
+import copy
 import os
 import numpy as np
 import theano
@@ -57,7 +58,7 @@ class KerasModel(Embedding):
         ae = [ll for ll in self.model.layers if isinstance(ll, AutoEncoder)][0]
         get_feature = theano.function([self.model.layers[0].input],
                                       ae.encoder.layers[layer].get_output(train=False),
-                                      allow_input_downcast=False)
+                                      allow_input_downcast=True)
         data = self.sounds_to_input(sound_inputs)
 
         return [out for out in get_feature(data)]
@@ -83,7 +84,9 @@ class KerasModel(Embedding):
         self.covariance = np.cov(outputs, rowvar=False)
         self.mean = np.mean(outputs, axis=0)
 
-    def sample(self, layer, mean=None, covariance=None):
+        return self.mean, self.covariance
+
+    def sample(self, layer, mean=None, covariance=None, nsamples=1):
 
         if mean is None:
             mean = self.mean
@@ -91,8 +94,19 @@ class KerasModel(Embedding):
             covariance = self.covariance
 
         ae = [ll for ll in self.model.layers if isinstance(ll, AutoEncoder)][0]
+        input_layer = ae.encoder.layers[layer]
+        layers = ae.encoder.layers[layer + 1:] + ae.decoder.layers
+        layers = copy.deepcopy(layers)
+
         new_model = Sequential()
-        new_model.add([ll for ll in ae.layers[layer:]]) # Not right yet
+        # Have to get rid of the "previous" layer for the new first layer
+        delattr(layers[0], "previous")
+        for ll in layers:
+            new_model.add(ll)
+        new_model.compile(optimizer="sgd", loss="mean_squared_error")
+        data = input_layer.activation(np.random.multivariate_normal(mean, covariance, nsamples))
+
+        return self.output_to_sounds(new_model.predict(data))
 
     @classmethod
     def load(cls, directory):
