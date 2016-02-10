@@ -31,3 +31,11 @@ load
 save
 
 I'd like all compute methods to have a wrapper that submits them to a cluster to run
+
+
+Hyperparameters:
+Number of layers
+layer sizes
+activation functions
+duration of sound chunks
+frequency bands

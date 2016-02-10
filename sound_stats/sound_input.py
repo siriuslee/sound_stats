@@ -95,6 +95,10 @@ class SoundInput(object):
 
         self._filename = store.filename
 
+    def clear_cache(self):
+
+        self._cached_data = None
+
     def plot(self, data=None):
 
         raise NotImplementedError()
@@ -214,3 +218,31 @@ class MFCC(SoundInput):
         super(MFCC, self).__init__(*args, **kwargs)
 
 
+def chunk_sound(sound, chunk_size, stride=0.5):
+    """
+    Vectorizes sound data
+    :param sound: a sound_input object
+    :param chunk_size: number of time points per chunk
+    :param stride: fraction of chunk_size to stride
+    :return: a list of vectorized data
+    """
+
+    duration = sound.data.shape[1]
+
+    chunks = list()
+    # Loop through all segments of the sound
+    for chunk_start in range(0, duration, int(chunk_size * stride)):
+        inds = range(chunk_start, chunk_start + chunk_size)
+
+        # If the segment extends beyond the duration of the sound,
+        # use just the last full segment that fits
+        if inds[-1] >= duration:
+            inds = range(duration - chunk_size, duration)
+
+        chunks.append(sound.data[:, inds].ravel())
+        if inds[-1] == (duration - 1):
+            break
+    
+    sound.clear_cache()
+
+    return chunks

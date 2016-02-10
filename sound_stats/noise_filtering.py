@@ -6,6 +6,7 @@ from keras.models import Sequential
 from keras.layers.core import Dense, Dropout, Activation
 from keras.layers.convolutional import Convolution2D
 from . import sound_input
+from . import embeddings
 
 def filters_to_weights(filename):
 
@@ -47,6 +48,33 @@ def stimuli_to_sound_inputs(directory, output_file=None, output="mask"):
         spec.sound = sound_input.Sound(stimulus, samplerate=fs)
         spec.compute(fft_pts * float(spec.sound.sampleperiod),
                      .001, min_freq=25, max_freq=8000)
+
+
+class NoiseFilterNetwork(embeddings.TimeDelayConvolutionNetwork):
+
+    def __init__(self, detection_length=None,
+                 reconstruction_length=None,
+                 reconstruction_delay=0,
+                 stride=0.5,
+                 output_type="mask",
+                 **kwargs):
+
+        super(NoiseFilterNetwork, self).__init__(input_size=detection_length,
+                                                 stride=stride,
+                                                 output_size=reconstruction_length,
+                                                 output_delay=reconstruction_delay,
+                                                 **kwargs)
+        self.output_type = output_type
+
+    def predict(self, sound_inputs, **kwargs):
+
+        stride = 1.0 / self.chunk_size
+        outputs = super(NoiseFilterNetwork, self).predict(sound_inputs, stride=stride, **kwargs)
+        if self.output_type == "mask":
+            logistic = lambda x: (1 + np.exp(-x)) ** -1
+            outputs = [logistic(out) for out in outputs]
+
+        return outputs
 
 
 ### NOTES:
