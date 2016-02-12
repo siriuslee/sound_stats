@@ -5,65 +5,22 @@ import os
 import numpy as np
 import theano
 from keras.models import Sequential, model_from_json
-from keras.layers.core import Dense, Dropout, AutoEncoder, ActivityRegularization
+from keras.layers.core import (Dense, Dropout,
+                               AutoEncoder, ActivityRegularization)
 from keras.layers.noise import GaussianNoise
 from keras.layers.normalization import BatchNormalization
 from keras.layers import containers
 from keras.optimizers import SGD
 from keras.callbacks import EarlyStopping
-from .sound_input import SoundInput
 
-def temporary_file():
-
-    import uuid
-
-    return os.path.join("/tmp", uuid.uuid4().get_hex())
-
-class Embedding(object):
-
-    def __init__(self, model=None, input_shape=None, **kwargs):
-
-        self.model = model
-        self.input_shape = input_shape
-        self.ds_filename = None
-
-    def create(self, *args, **kwargs):
-
-        raise NotImplementedError()
-
-    def fit(self, sound_inputs, **kwargs):
-
-        pass
-
-    def sounds_to_dataset(self, sound_inputs, batch_size=128):
-
-        raise NotImplementedError()
-
-    def sounds_to_input(self, sound_inputs):
-
-        raise NotImplementedError()
-
-    def output_to_sounds(self, output):
-
-        raise NotImplementedError()
-
-    @classmethod
-    def load(cls, filename):
-
-        pass
-
-    def save(self, filename):
-
-        pass
-
-
-class KerasModel(Embedding):
+class KerasModel(object):
 
     _save_attrs = ["input_shape"]
 
     def __init__(self, zscore=False, **kwargs):
 
-        super(KerasModel, self).__init__(**kwargs)
+        self.model = model
+        self.input_shape = input_shape
         self.mean = None
         self.covariance = None
         self.zscore = zscore
@@ -211,49 +168,6 @@ class DeepNetwork(KerasModel):
 
         super(DeepNetwork, self).__init__(**kwargs)
 
-
-    def sounds_to_dataset(self, sound_inputs, batch_size=128):
-
-        self.ds_filename = temporary_file()
-        data_shape = (len(sound_inputs), np.prod(self.input_shape))
-
-        mean = np.zeros(data_shape[1])
-        std = np.ones(data_shape[1])
-        if self.zscore:
-            for s in sound_inputs:
-                data = s.data.ravel()
-                s.clear_cache()
-                mean += data
-                std += data ** 2
-            std = np.sqrt(std / len(sound_inputs) - mean ** 2 / len(sound_inputs))
-            mean = mean / len(sound_inputs)
-
-        with h5py.File(self.ds_filename, "w") as hf:
-            ds = hf.create_dataset("input",
-                                   data_shape,
-                                   chunks=(batch_size, data_shape[1]))
-            data = list()
-            start = 0
-            for s in sound_inputs:
-                data.append(s.data.ravel())
-                s.clear_cache()
-                if len(data) == batch_size:
-                    ds[start: start + batch_size] = (np.vstack(data) - mean) / std
-                    start += batch_size
-                    data = list()
-            if len(data):
-                ds[start: start + len(data)] = np.vstack(data)
-
-        return self.ds_filename
-
-    def sounds_to_input(self, sound_inputs):
-
-        return np.vstack([s.data.ravel() for s in sound_inputs])
-
-    def output_to_sounds(self, output):
-
-        return [out.reshape(self.input_shape) for out in output]
-
     def create(self, input_shape,
                layer_sizes,
                noise_sigma=0.1,
@@ -280,7 +194,6 @@ class DeepNetwork(KerasModel):
                 raise ValueError("If activation is a list it must be of the same length as layer sizes")
         else:
             activation = [activation] * len(layer_sizes)
-
 
         input_dim = np.prod(self.input_shape)
 
@@ -351,112 +264,6 @@ class TimeConvolutionNetwork(DeepNetwork):
         self._input_numbers = None
         self._input_durations = None
 
-    def sounds_to_dataset(self, sound_inputs, batch_size=128):
-        """
-        Convert sound inputs to hdf5 datasets. Each row in the dataset is a vectorized segment of sound.
-        :param sound_inputs: list of sound_input objects
-        :param batch_size: specifies the number of rows per hdf5 chunk.
-        :return: name of hdf5 file containing the dataset
-        """
-
-        self.ds_filename = temporary_file() # Get a /tmp filename
-
-        get_nchunks = lambda dur: np.ceil(float(dur) / int(self.chunk_size * self.stride))
-
-        # Compute the total number of vectorized samples in the list of sound_inputs
-        nsamples = np.sum([get_nchunks(s.sound.annotations["data_shape"][1]) for s in sound_inputs])
-        data_shape = (nsamples, np.prod(self.input_shape))
-
-        mean = np.zeros(data_shape[1])
-        std = np.ones(data_shape[1])
-        if self.zscore:
-            for s in sound_inputs:
-                chunks = np.vstack(self.vectorize_sound(s))
-                mean += np.sum(chunks, axis=0)
-                std += np.sum(chunks ** 2, axis=0)
-            std = np.sqrt(std / nsamples - mean ** 2 / nsamples)
-            mean = mean / nsamples
-
-        with h5py.File(self.ds_filename, "w") as hf:
-            ds = hf.create_dataset("input",
-                                   data_shape,
-                                   chunks=(batch_size, data_shape[1]))
-            data = list()
-            start = 0
-            for s in sound_inputs:
-                chunks = self.vectorize_sound(s)
-                # Do I need to store in the same size chunks as specified when the ds was created?
-                # Seems like smaller is definitely okay
-                ds[start: start + len(chunks)] = (np.vstack(chunks) - mean) / std
-                start += len(chunks)
-
-        return self.ds_filename
-
-    def vectorize_sound(self, sound):
-        """
-        Vectorizes sound data
-        :param sound: a sound_input object
-        :return: a list of vectorized data
-        """
-
-        duration = sound.data.shape[1]
-
-        chunks = list()
-        # Loop through all segments of the sound
-        for chunk_start in range(0, duration, int(self.chunk_size * self.stride)):
-            inds = range(chunk_start, chunk_start + self.chunk_size)
-
-            # If the segment extends beyond the duration of the sound,
-            # use just the last full segment that fits
-            if inds[-1] >= duration:
-                inds = range(duration - self.chunk_size, duration)
-
-            chunks.append(sound.data[:, inds].ravel())
-            if inds[-1] == (duration - 1):
-                break
-        sound.clear_cache()
-
-        return chunks
-
-
-    def sounds_to_input(self, sound_inputs):
-
-        data = list()
-        self._input_numbers = list()
-        self._input_durations = dict()
-        for ii, s in enumerate(sound_inputs):
-            duration = s.data.shape[1]
-            self._input_durations[ii] = duration
-            for chunk in xrange(0, duration, int(self.chunk_size * self.stride)):
-                inds = range(chunk, chunk + self.chunk_size)
-                if inds[-1] >= duration:
-                    inds = range(duration - self.chunk_size, duration)
-                data.append(s.data[:, inds].ravel())
-                self._input_numbers.append((ii, inds[0]))
-                if inds[-1] == (duration - 1):
-                    break
-
-        return np.vstack(data)
-
-    def output_to_sounds(self, output):
-
-        sounds = list()
-        last_input = -1
-        for ii, out in enumerate(output):
-            input, chunk = self._input_numbers[ii]
-            if input != last_input:
-                if ii != 0:
-                    sounds.append(s / m)
-                s = np.zeros((self.input_shape[0], self._input_durations[input]))
-                m = np.zeros_like(s)
-                last_input = input
-            inds = range(chunk, chunk + self.chunk_size)
-            s[:, inds] += out.reshape(self.input_shape)
-            m[:, inds] += 1.0
-        sounds.append(s / m)
-
-        return sounds
-
     def create(self, input_shape, *args, **kwargs):
 
         if isinstance(input_shape, SoundInput):
@@ -521,105 +328,3 @@ class TimeDelayConvolutionNetwork(TimeConvolutionNetwork):
         output = self.model.predict(data, **kwargs)
 
         return self.output_to_sounds(output)
-
-    def sounds_to_dataset(self, sound_inputs, sound_outputs=None, batch_size=128):
-
-        if sound_outputs is None:
-            sound_outputs = sound_inputs
-
-        self.ds_filename = temporary_file()
-        get_nchunks = lambda dur: np.ceil(float(dur) / int(self.chunk_size * self.stride))
-        nsamples = np.sum([get_nchunks(s.sound.annotations["data_shape"][1]) for s in sound_inputs])
-        input_shape = (nsamples, np.prod(self.input_shape))
-        output_shape = (nsamples, self.input_shape[0] * self.output_size)
-        with h5py.File(self.ds_filename, "w") as hf:
-            ds_input = hf.create_dataset("input",
-                                         input_shape,
-                                         chunks=(batch_size, input_shape[1]))
-            ds_output = hf.create_dataset("output",
-                                          output_shape,
-                                          chunks=(batch_size, output.shape[1]))
-            inputs = list()
-            outputs = list()
-            start = 0
-            for si, so in zip(sound_inputs, sound_outputs):
-                duration = si.data.shape[1]
-                last_ind = duration - self.output_delay + (self.chunk_size - self.output_size)
-                for chunk in xrange(0, duration, int(self.chunk_size * self.stride)):
-                    inds = range(chunk, chunk + self.chunk_size)
-                    if inds[-1] >= last_ind:
-                        inds = range(last_ind - self.chunk_size, last_ind)
-                    inputs.append(si.data[:, inds].ravel())
-                    output_inds = range(inds[0] + self.output_delay,
-                                        inds[0] + self.output_delay + self.output_size)
-                    outputs.append(so.data[:, output_inds].ravel())
-                    if len(inputs) == batch_size:
-                        ds_input[start: start + batch_size] = np.vstack(inputs)
-                        ds_output[start: start + batch_size] = np.vstack(outputs)
-                        start += batch_size
-                        inputs = list()
-                        outputs = list()
-                    if inds[-1] == (last_ind - 1):
-                        break
-                si.clear_cache()
-                so.clear_cache()
-
-            if len(inputs):
-                ds_input[start: start + len(inputs)] = np.vstack(inputs)
-                ds_outputs[start: start + len(outputs)] = np.vstack(outputs)
-
-        return self.ds_filename
-
-    def sounds_to_input(self, sound_inputs, sound_outputs=None, stride=None):
-
-        if sound_outputs is None:
-            sound_outputs = sound_inputs
-
-        if stride is None:
-            stride = self.stride
-
-        inputs = list()
-        outputs = list()
-        self._input_numbers = list()
-        self._input_durations = dict()
-        for ii, (si, so) in enumerate(zip(sound_inputs, sound_outputs)):
-            duration = si.data.shape[1]
-            last_ind = duration - self.output_delay + (self.chunk_size - self.output_size)
-            self._input_durations[ii] = duration
-            for chunk in xrange(0, duration, int(stride * self.chunk_size)):
-                inds = range(chunk, chunk + self.chunk_size)
-                if inds[-1] >= last_ind:
-                    inds = range(last_ind - self.chunk_size, last_ind)
-                inputs.append(si.data[:, inds].ravel())
-                output_inds = range(inds[0] + self.output_delay,
-                                    inds[0] + self.output_delay + self.output_size)
-                outputs.append(so.data[:, output_inds].ravel())
-                self._input_numbers.append((ii, inds[0]))
-                if inds[-1] == (last_ind - 1):
-                    break
-
-        return np.vstack(inputs), np.vstack(outputs)
-
-    def output_to_sounds(self, output):
-
-        sounds = list()
-        last_input = -1
-        for ii, out in enumerate(output):
-            input, chunk = self._input_numbers[ii]
-            if input != last_input:
-                if ii != 0:
-                    s[m != 0] /= m[m != 0]
-                    sounds.append(s)
-                s = np.zeros((self.input_shape[0], self._input_durations[input]))
-                m = np.zeros_like(s)
-                last_input = input
-            inds = range(chunk + self.output_delay,
-                         chunk + self.output_delay + self.output_size)
-            s[:, inds] += out.reshape((self.input_shape[0], self.output_size))
-            m[:, inds] += 1.0
-        s[m != 0] /= m[m != 0]
-        sounds.append(s)
-
-        return sounds
-
-
