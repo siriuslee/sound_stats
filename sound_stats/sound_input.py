@@ -1,11 +1,17 @@
 from __future__ import division, print_function
+import os
+import h5py
 import uuid
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
 from lasp.timefreq import (gaussian_stft, bandpass_timefreq,
                            define_f_bands, log_spectrogram)
 
+logging.basicConfig()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 class SoundData(object):
 
@@ -25,6 +31,7 @@ class SoundData(object):
         """
 
         self.filename = filename
+        self.batch_size = batch_size
         if os.path.exists(filename):
             self.load()
         else:
@@ -32,7 +39,7 @@ class SoundData(object):
                 pass
             self.chunk_size = chunk_size
             if (self.chunk_size is not None) and (increment is None):
-                increment = 0.5 * self.chunk_size
+                increment = int(0.5 * self.chunk_size)
             self.increment = increment
             self.save()
 
@@ -61,6 +68,7 @@ class SoundData(object):
             for ii, val in enumerate(waveform):
                 waveform[ii], fs = self.load_waveform(waveform, samplerate=samplerate)
         elif isinstance(waveform, str):
+            logger.debug("Loading from %s" % waveform)
             fs, waveform = wavfile.read(waveform)
         else:
             fs = samplerate
@@ -81,7 +89,7 @@ class SoundData(object):
                 # If the segment extends beyond the duration of the sound,
                 # use just the last full segment that fits
                 if inds[-1] >= duration:
-                    inds = range(duration - chunk_size, duration)
+                    inds = range(duration - self.chunk_size, duration)
 
                 chunks.append(data[:, inds].ravel())
                 if inds[-1] == (duration - 1):
@@ -91,7 +99,7 @@ class SoundData(object):
 
         return np.vstack(chunks)
 
-    def compute_and_store(waveforms, *args, **kwargs):
+    def compute_and_store(self, waveforms, *args, **kwargs):
         """
         Computes the transformation on each sound in waveforms and stores them in a dataset.
         :param waveforms: list of sound waveforms or .wav files
@@ -105,24 +113,26 @@ class SoundData(object):
         append = False
         start = 0
         with h5py.File(self.filename, "a") as hf:
+            logger.info("Starting loop through %d waveforms" % len(waveforms))
             for ii, waveform in enumerate(waveforms):
                 waveform, fs = self.load_waveform(waveform, samplerate)
                 kwargs["samplerate"] = fs
+                logger.info("%d) Computing transform" % ii)
                 outputs = self.compute(waveform, *args, **kwargs)
 
-                if isinstance(output, tuple):
+                if isinstance(outputs, tuple):
                     outputs = list(outputs)
                 else:
                     outputs = [outputs]
 
-                if jj == 0:
+                if ii == 0:
                     datasets = list()
-                    for kk, output in enumerate(outputs):
-                        if chunk_size is None:
+                    for jj, output in enumerate(outputs):
+                        if self.chunk_size is None:
                             ncols = np.prod(output.shape)
                         else:
-                            ncols = output.shape[0] * chunk_size
-                        ds = hf.create_dataset("data%d" % kk,
+                            ncols = output.shape[0] * self.chunk_size
+                        ds = hf.create_dataset("data%d" % jj,
                                                (1, ncols),
                                                maxshape=(None, ncols),
                                                chunks=(self.batch_size, ncols))
@@ -173,11 +183,11 @@ class Spectrogram(SoundData):
         self.frequencies = None
         self.time = None
 
-    def compute(self, waveform, window_length, increment,
+    def compute(self, waveform, window_length, increment, samplerate=16000,
                 min_freq=0, max_freq=None, nstd=6, offset=50):
 
         self.time, self.frequencies, spec = gaussian_stft(waveform,
-                                                          self.sound.samplerate,
+                                                          samplerate,
                                                           window_length,
                                                           increment,
                                                           min_freq=min_freq,
@@ -213,9 +223,9 @@ class MeanCenterSpectrogram(Spectrogram):
     def compute(self, *args, **kwargs):
 
         output = super(MeanCenterSpectrogram, self).compute(*args, **kwargs)
-        self.mean = np.mean(data, axis=1)
+        self.mean = np.mean(output, axis=1)
 
-        return ouptut - mean
+        return output - self.mean.reshape(-1, 1)
 
 
 class RatioMask(SoundData):
