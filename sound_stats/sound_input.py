@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 from __future__ import division, print_function
 import os
 import h5py
@@ -46,44 +48,51 @@ class SoundData(object):
     @property
     def X(self):
 
-        with h5py.File(self.filename, "r") as hf:
-            if "data0" in hf:
-                return hf["data0"]
-            else:
-                return
+        if not hasattr(self, "_hf"):
+            self._hf = h5py.File(self.filename, "r")
+        if "data0" in self._hf:
+            return self._hf["data0"]
+        else:
+            self._hf.close()
+            del self._hf
+            return
 
     @property
     def y(self):
-        with h5py.File(self.filename, "r") as hf:
-            if "data1" in hf:
-                return hf["data1"]
-            else:
-                return
 
-    @staticmethod
-    def load_waveform(waveform, samplerate=16000):
+        if not hasattr(self, "_hf"):
+            self._hf = h5py.File(self.filename, "r")
+        if "data1" in self._hf:
+            return self._hf["data1"]
+        else:
+            return self.X
+
+    @classmethod
+    def load_waveform(cls, waveform, samplerate=16000):
 
         if isinstance(waveform, tuple):
             waveform = list(waveform)
             for ii, val in enumerate(waveform):
-                waveform[ii], fs = self.load_waveform(waveform, samplerate=samplerate)
+                waveform[ii], fs = cls.load_waveform(val, samplerate=samplerate)
         elif isinstance(waveform, str):
             logger.debug("Loading from %s" % waveform)
             fs, waveform = wavfile.read(waveform)
+            if len(waveform.shape) > 1:
+                waveform = waveform.mean(axis=1)
         else:
             fs = samplerate
 
-        if len(waveform.shape) > 1:
-            waveform = waveform.mean(axis=1)
-
         return waveform, fs
 
-    def chunk_data(self, data):
+    def chunk_data(self, data, offset=0):
+
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
 
         if self.chunk_size is not None:
             chunks = list()
             duration = data.shape[1]
-            for start in range(0, duration, self.increment):
+            for start in range(offset, duration, self.increment):
                 inds = range(start, start + self.chunk_size)
 
                 # If the segment extends beyond the duration of the sound,
@@ -99,6 +108,64 @@ class SoundData(object):
 
         return np.vstack(chunks)
 
+    def split(self, waveforms, *args, **kwargs):
+        import yaml
+        from .utils import get_temporary_directory, dump_wavefiles
+
+        cluster = kwargs.pop("cluster", True)
+        num_per = kwargs.pop("num_per", 1)
+        cluster_params = kwargs.pop("cluster_params", dict())
+        samplerate = kwargs.get("samplerate", 16000)
+
+        tmp_dir = get_temporary_directory()
+        os.makedirs(tmp_dir)
+        logging.debug("Outputting to %s" % tmp_dir)
+
+        if (cluster is True) or (cluster == "slurm"):
+            from .utils import SlurmRunner
+            runner = SlurmRunner()
+            logger.debug("Running on slurm")
+            cluster_params.setdefault("out", os.path.join(tmp_dir, "slurm-%j.out"))
+        elif cluster == "savio":
+            # map to savio
+            logger.debug("Running on savio")
+            pass
+
+        arg_dict = dict(inputs=list(),
+                        args=args,
+                        kwargs=kwargs,
+                        class_name=self.__class__)
+        jobIds = list()
+        njobs = int((len(waveforms) - 1) / num_per) + 1
+        for job in range(njobs):
+            start = job * num_per
+            yaml_file = os.path.join(tmp_dir, "job_%d.yaml" % job)
+            arg_dict["inputs"] = dump_wavefiles(waveforms[start: start + num_per],
+                                                tmp_dir,
+                                                sample_rate=samplerate)
+            with open(yaml_file, "w") as fh:
+                yaml.dump(arg_dict, fh)
+
+            cmdList = [__file__,
+                       self.filename,
+                       yaml_file]
+            if cmdList[0].endswith(".pyc"):
+                cmdList[0] = cmdList[0][:-1]
+
+            logger.debug("Running on cluster with command: %s" % " ".join(cmdList))
+            jobId = runner.run(cmdList, **cluster_params)
+            jobIds.append(jobId)
+
+        return jobIds
+
+    def merge(self, filenames):
+
+        # TODO: If filenames is a directory, load all h5 files from it
+        # TODO: for all filenames, load up dataset and append to objects dataset
+        # TODO: Delete h5 and yaml files for all those added
+        # TODO: Alert of any remaining yaml files
+        pass
+
     def compute_and_store(self, waveforms, *args, **kwargs):
         """
         Computes the transformation on each sound in waveforms and stores them in a dataset.
@@ -109,6 +176,7 @@ class SoundData(object):
         """
 
         samplerate = kwargs.pop("samplerate", 16000)
+        offset = kwargs.pop("offset", 0)
         # append = kwargs.pop("append", False)
         append = False
         start = 0
@@ -139,7 +207,7 @@ class SoundData(object):
                         datasets.append(ds)
 
                 for ds, output in zip(datasets, outputs):
-                    output = self.chunk_data(output)
+                    output = self.chunk_data(output, offset=offset)
                     nrows = output.shape[0]
                     ds.resize(start + nrows, 0)
                     ds[start: start+nrows] = output
@@ -230,35 +298,42 @@ class MeanCenterSpectrogram(Spectrogram):
 
 class RatioMask(SoundData):
 
-    _save_attrs = ["frequencies", "time", "alpha"]
+    _save_attrs = ["frequencies", "time", "alpha", "mean", "global_sub"]
 
     def __init__(self, *args, **kwargs):
 
         self.alpha = kwargs.get("alpha", 1.0)
+        self.global_sub = kwargs.get("global_sub", False)
+        self.mean = None
         self.frequencies = None
         self.time = None
         super(RatioMask, self).__init__(*args, **kwargs)
 
-    def compute(self, waveforms, window_length, increment, min_freq=0, max_freq=None, nstd=6):
+    def compute(self, waveforms, window_length, increment, samplerate=16000, min_freq=0, max_freq=None, nstd=6, offset=50):
 
         signal, stimulus = waveforms
 
         self.time, self.frequencies, spec = gaussian_stft(signal,
-                                                          self.sound.samplerate,
+                                                          samplerate,
                                                           window_length,
                                                           increment,
                                                           min_freq=min_freq,
                                                           max_freq=max_freq,
                                                           nstd=nstd)[:3]
         stim_spec = gaussian_stft(stimulus,
-                                  self.sound.samplerate,
+                                  samplerate,
                                   window_length,
                                   increment,
                                   min_freq=min_freq,
                                   max_freq=max_freq,
                                   nstd=nstd)[2]
 
-        return stim_spec, np.abs(spec) ** self.alpha / np.abs(stim_spec) ** self.alpha
+        ratio_mask = np.abs(spec) ** self.alpha / np.abs(stim_spec) ** self.alpha
+        stim_spec = log_spectrogram(stim_spec, offset=offset)
+        self.mean = np.mean(stim_spec, axis=1)
+        stim_spec -= self.mean.reshape(-1, 1)
+
+        return stim_spec, ratio_mask
 
 
 class Cochleagram(SoundData):
@@ -364,3 +439,38 @@ def chunk_sound(sound, chunk_size, stride=0.5):
     sound.clear_cache()
 
     return chunks
+
+
+if __name__ == "__main__":
+
+    import argparse
+    import yaml
+    import sys
+
+    # Add sound_stats conda env to path
+    sys.path.insert(0, "/auto/fhome/tlee/miniconda2/envs/sound_stats/bin")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("filename")
+    parser.add_argument("yaml")
+
+    args = parser.parse_args()
+
+    filename = args.filename
+    logger.info("Running on sound database in %s" % filename)
+    with open(args.yaml, "r") as fh:
+        vars = yaml.load(fh)
+
+    logger.info("Using yaml file from %s" % args.yaml)
+    # Load the SoundData object
+    logger.info("Initializing class named %s" % vars["class_name"].__name__)
+    obj = vars["class_name"](filename)
+
+    # Replace the filename
+    new_filename = args.yaml.replace(".yaml", ".h5")
+    obj.filename = new_filename
+    logger.info("Output dataset chunk to %s" % new_filename)
+
+    # Call compute_and_store
+    logger.info("Calling compute_and_store on %d inputs" % len(vars["inputs"]))
+    obj.compute_and_store(vars["inputs"], *vars["args"], **vars["kwargs"])

@@ -20,7 +20,7 @@ def filters_to_weights(filename):
 
     return weights
 
-def stimuli_to_sound_inputs(directory, output_file=None, output="mask"):
+def stimuli_from_mat(directory, train=True):
 
     stim_file = os.path.join(directory, "stimuli.mat")
     time_frequency_file = os.path.join(directory, "time_frequency.mat")
@@ -28,26 +28,38 @@ def stimuli_to_sound_inputs(directory, output_file=None, output="mask"):
                                                               "trainingSet", "testingSet",
                                                               "wavStimIndex", "Preprocessing"])
 
+    # Get data from the mat file
     training_inds = tmp["trainingSet"]
     testing_inds = tmp["testingSet"]
+    if train:
+        inds = training_inds
+    else:
+        inds = testing_inds
     stim_inds = tmp["wavStimIndex"]
     signal = tmp["signal"]
     stimulus = tmp["stimulus"]
-    fs = int(tmp["Preprocessing"]) * sound_input.hertz
+    fs = int(tmp["Preprocessing"]["fs"])
 
+    # Get time-frequency parameters as well
+    params = dict()
+    params["samplerate"] = fs
     with h5py.File(time_frequency_file, "r") as hf:
-        params = dict()
-        keys = ["windowLength", "specFs", "lowFrequency", "highFrequency",
-                "bandwidth", "dBFloor"]
-        for key in keys:
-            params[key] = hf["TimeFrequency"][key][()].squeeze()
+        getval = lambda ss: hf["TimeFrequency"][ss][()].squeeze()
+        params["window_length"] = getval("windowLength")
+        params["increment"] = 1.0 / getval("specFs")
+        params["min_freq"] = getval("lowFrequency")
+        params["max_freq"] = getval("highFrequency")
+        params["offset"] = -getval("dBFloor")
 
-    for ii in training_inds:
+    # Get list of signals and stimuli
+    signals = list()
+    stimuli = list()
+    for ii in inds:
         inds = stim_inds == ii
-        spec = sound_input.MeanCenterSpectrogram()
-        spec.sound = sound_input.Sound(stimulus, samplerate=fs)
-        spec.compute(fft_pts * float(spec.sound.sampleperiod),
-                     .001, min_freq=25, max_freq=8000)
+        signals.append(signal[inds])
+        stimuli.append(stimulus[inds])
+
+    return signals, stimuli, params
 
 
 class NoiseFilterNetwork(embeddings.TimeDelayConvolutionNetwork):
@@ -79,4 +91,3 @@ class NoiseFilterNetwork(embeddings.TimeDelayConvolutionNetwork):
 
 ### NOTES:
 ### If the reconstruction delays range from a0 to aM and the encoding delays range from b0 to bM, then the total number of time points needed for a single batch is (aM + bM) - (a0 + b0) + (batch_size - 1). Traditionally this has been (0 + 99) - (-99 + 0) + (batch_size - 1) = 197 + batch_size.
-
