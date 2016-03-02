@@ -45,7 +45,7 @@ def stimuli_from_mat(directory, train=True):
     params["samplerate"] = fs
     with h5py.File(time_frequency_file, "r") as hf:
         getval = lambda ss: hf["TimeFrequency"][ss][()].squeeze()
-        params["window_length"] = getval("windowLength")
+        params["window_length"] = getval("windowLength") / fs
         params["increment"] = 1.0 / getval("specFs")
         params["min_freq"] = getval("lowFrequency")
         params["max_freq"] = getval("highFrequency")
