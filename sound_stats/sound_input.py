@@ -15,6 +15,16 @@ logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+def run_on_cluster(func):
+
+    def split(*args, **kwargs):
+        # Should split all args the same length as the first arg into several batches and run on the cluster
+        # Then start a merge job that depends on the others to run at the very end
+
+        return func(*args, **kwargs)
+
+    return split
+
 class SoundData(object):
 
     _SAVE_ATTRS = ["chunk_size", "increment"]
@@ -84,7 +94,7 @@ class SoundData(object):
 
         return waveform, fs
 
-    def chunk_data(self, data, offset=0):
+    def chunk_data(self, data, temporal_offset=0):
 
         if offset < 0:
             raise ValueError("offset must be >= 0")
@@ -92,7 +102,7 @@ class SoundData(object):
         if self.chunk_size is not None:
             chunks = list()
             duration = data.shape[1]
-            for start in range(offset, duration, self.increment):
+            for start in range(temporal_offset, duration, self.increment):
                 inds = range(start, start + self.chunk_size)
 
                 # If the segment extends beyond the duration of the sound,
@@ -251,7 +261,8 @@ class Spectrogram(SoundData):
         self.frequencies = None
         self.time = None
 
-    def compute(self, waveform, window_length, increment, samplerate=16000,
+    def compute(self, waveform, window_length=window_length,
+                increment=increment, samplerate=16000,
                 min_freq=0, max_freq=None, nstd=6, offset=50):
 
         self.time, self.frequencies, spec = gaussian_stft(waveform,
@@ -309,7 +320,9 @@ class RatioMask(SoundData):
         self.time = None
         super(RatioMask, self).__init__(*args, **kwargs)
 
-    def compute(self, waveforms, window_length, increment, samplerate=16000, min_freq=0, max_freq=None, nstd=6, offset=50):
+    def compute(self, waveforms, window_length=window_length,
+                increment=increment, samplerate=16000,
+                min_freq=0, max_freq=None, nstd=6, offset=50):
 
         signal, stimulus = waveforms
 
