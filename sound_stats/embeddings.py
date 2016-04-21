@@ -5,119 +5,107 @@ import os
 import numpy as np
 import theano
 from keras.models import Sequential, model_from_json
-from keras.layers.core import (Dense, Dropout,
-                               AutoEncoder, ActivityRegularization)
+from keras.layers.core import (Dense, TimeDistributedDense, Dropout,
+                               ActivityRegularization, Activation)
+from keras.layers.convolutional import Convolution1D
+from keras.layers.recurrent import SimpleRNN
 from keras.layers.noise import GaussianNoise
 from keras.layers.normalization import BatchNormalization
-from keras.layers import containers
 from keras.optimizers import SGD
-from keras.callbacks import EarlyStopping
+from keras.callbacks import EarlyStopping, ModelCheckpoint
 
-class KerasModel(object):
+class KerasModel(Sequential):
 
-    _save_attrs = ["input_shape"]
+    def __init__(self, output_directory=None, **kwargs):
 
-    def __init__(self, zscore=False, **kwargs):
+        self.output_directory = output_directory
+        super(KerasModel, self).__init__(**kwargs)
+        if self.output_directory is not None:
+            if not os.path.exists(self.output_directory):
+                os.makedirs(self.output_directory)
 
-        self.model = model
-        self.input_shape = input_shape
-        self.mean = None
-        self.covariance = None
-        self.zscore = zscore
-        self.zscore_params = list()
+    def fit(self, X, y=None, batch_size=None, shuffle="batch",
+            callbacks=None, validation_split=0.1, es_epochs=5, checkpoint=True,
+            **kwargs):
 
-    def fit(self, sound_inputs, batch_size=128, **kwargs):
+        if batch_size is None:
+            if hasattr(X, "chunks"):
+                batch_size = X.chunks[0]
+            else:
+                batch_size = 128
 
-        if isinstance(sound_inputs, list):
-            self.zscore_params = list()
-            filename = self.sounds_to_dataset(sound_inputs, batch_size=batch_size)
-        elif os.path.isfile(sound_inputs):
-            filename = sound_inputs
-        elif self.ds_filename is not None:
-            filename = self.ds_filename
-        else:
-            IOError("No sound inputs file named %s" % sound_inputs)
+        if callbacks is None:
+            callbacks = list()
+        callbacks.append(EarlyStopping(patience=es_epochs))
+        if checkpoint and self.output_directory is not None:
+            filepath = os.path.join(self.output_directory,
+                                    "weights.{epoch:02d}.hdf5")
+            callbacks.append(ModelCheckpoint(filepath, verbose=1))
 
-        with h5py.File(filename, "r") as hf:
-            data = hf["input"]
-            self.model.fit(data, data, batch_size=batch_size, **kwargs)
+        if y is None:
+            y = X
 
-    def get_encoder_layer(self, layer):
+        return super(KerasModel, self).fit(X, y,
+                                           batch_size=batch_size,
+                                           shuffle=shuffle,
+                                           validation_split=validation_split,
+                                           callbacks=callbacks,
+                                           **kwargs)
 
-        ae = [ll for ll in self.model.layers if isinstance(ll, AutoEncoder)][0]
-        layers = [ll for ll in ae.encoder.layers if hasattr(ll, "W")]
+    def get_layer_output(self, X, layer):
 
-        try:
-            return layers[layer]
-        except IndexError:
-            raise IndexError("Model only has %d encoder layers with weights" % len(layers))
-
-    def get_output(self, sound_inputs, layer):
-
-        ll = self.get_encoder_layer(layer)
-        get_feature = theano.function([self.model.layers[0].input],
-                                      ll.get_output(train=False),
+        get_feature = theano.function([self.layers[0].input],
+                                      layer.get_output(train=False),
                                       allow_input_downcast=True)
-        data = self.sounds_to_input(sound_inputs)
 
-        return [out for out in get_feature(data)]
+        return [out for out in get_feature(X)]
 
-    def predict(self, sound_inputs, **kwargs):
+    def get_filters(self, layer, input_shape=None):
 
-        data = self.sounds_to_input(sound_inputs)
-        output = self.model.predict(data, **kwargs)
+        layers = list()
+        while True:
+            layers.insert(0, layer)
+            if hasattr(layer, "previous"):
+                layer = layer.previous
+            else:
+                break
 
-        return self.output_to_sounds(output)
+        layer_num = 0
+        for layer in reversed(layers):
+            if hasattr(layer, "W"):
+                layer_num += 1
+                if layer_num == 1:
+                    filters = layer.get_weights()[0]
+                else:
+                    filters = np.dot(filters, layer.get_weights()[0])
 
-    def evaluate(self, sound_inputs, **kwargs):
+        if input_shape is None:
+            input_shape = filters[:, ii].shape
 
-        data = self.sounds_to_input(sound_inputs)
+        return [filters[:, ii].reshape(input_shape) for ii in range(filters.shape[1])]
 
-        return self.model.evaluate(data, data, **kwargs)
+    def evaluate(self, X, y=None, **kwargs):
 
-    def compute_statistics(self, sound_inputs=None, layer=None, outputs=None):
+        if y is None:
+            y = X
+
+        return super(KerasModel, self).evaluate(X, y, **kwargs)
+
+    def compile(self, loss="mean_squared_error", optimizer="adam", **kwargs):
+
+        return super(KerasModel, self).compile(loss=loss,
+                                               optimizer=optimizer,
+                                               **kwargs)
+
+    def compute_statistics(self, X=None, layer=None, outputs=None):
 
         if outputs is None:
-            outputs = self.get_output(sound_inputs, layer)
+            outputs = self.get_output(X, layer)
         outputs = np.vstack(outputs)
         self.covariance = np.cov(outputs, rowvar=False)
         self.mean = np.mean(outputs, axis=0)
 
         return self.mean, self.covariance
-
-    def get_filters(self, layer):
-
-        for ii in range(layer + 1):
-            ll = self.get_encoder_layer(ii)
-            if ii == 0:
-                filters = ll.get_weights()[0]
-            else:
-                filters = np.dot(filters, ll.get_weights()[0])
-
-        return [filters[:, ii].reshape(self.input_shape) for ii in range(filters.shape[1])]
-
-    def sample(self, layer, mean=None, covariance=None, nsamples=1):
-
-        if mean is None:
-            mean = self.mean
-        if covariance is None:
-            covariance = self.covariance
-
-        ae = [ll for ll in self.model.layers if isinstance(ll, AutoEncoder)][0]
-        input_layer = ae.encoder.layers[layer]
-        layers = ae.encoder.layers[layer + 1:] + ae.decoder.layers
-        layers = copy.deepcopy(layers)
-
-        new_model = Sequential()
-        # Have to get rid of the "previous" layer for the new first layer
-        delattr(layers[0], "previous")
-        layers[0].set_input_shape((input_layer.ouput_dim,))
-        for ll in layers:
-            new_model.add(ll)
-        new_model.compile(optimizer="sgd", loss="mean_squared_error")
-        data = np.random.multivariate_normal(mean, covariance, nsamples)
-
-        return self.output_to_sounds(new_model.predict(data))
 
     @classmethod
     def load(cls, directory):
@@ -130,45 +118,190 @@ class KerasModel(object):
 
         model = model_from_json(json_string)
         model.load_weights(weights_file)
-        params = dict()
-        with h5py.File(weights_file, "r") as hf:
-            g = hf["model_attr"]
-            for key, ds in g.items():
-                params[key] = ds[()]
+        model.__class__ = cls
 
-        emb = cls(model=model, **params)
+        return model
 
-        return emb
+    def save(self, directory=None, overwrite=False, weights=True,
+             model_file="models.json", weights_file="weights.h5"):
 
-    def save(self, directory, overwrite=False):
+        if directory is not None:
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+        else:
+            directory = self.output_directory
 
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-
-        weights_file = os.path.join(directory, "weights.h5")
-        model_file = os.path.join(directory, "model.json")
-
-        if overwrite or not os.path.isfile(weights_file):
-            self.model.save_weights(weights_file, overwrite=overwrite)
+        weights_file = os.path.join(directory, weights_file)
+        model_file = os.path.join(directory, model_file)
+        if overwrite or not os.path.isfile(model_file):
             with open(model_file, "w") as f:
-                f.write(self.model.to_json())
-            if self._save_attrs is not None and len(self._save_attrs) > 0:
-                with h5py.File(weights_file, "a") as hf:
-                    g = hf.create_group("model_attr")
-                    for key in self._save_attrs:
-                        val = getattr(self, key, None)
-                        g.create_dataset(key, data=val)
+                f.write(self.to_json())
+            if weights:
+                self.save_weights(weights_file, overwrite=overwrite)
+
+    def get_config(self, *args, **kwargs):
+
+        config = super(KerasModel, self).get_config(*args, **kwargs)
+        config["name"] = "Sequential"
+
+        return config
+
+    @staticmethod
+    def _format_params_nlayers(param, nlayers):
+
+        if isinstance(param, (list, tuple)):
+            if len(param) != nlayers:
+                raise ValueError("If parameter is a list, it must be the same length as the number of layers: %d" % nlayers)
+        else:
+            param = [param] * nlayers
+
+        return param
 
 
-class DeepNetwork(KerasModel):
+class Convolution1DAutoEncoder(KerasModel):
 
-    _save_attrs = ["input_shape"]
+    def __init__(self, input_dim,
+                 layer_sizes,
+                 input_filter_length,
+                 noise_sigma=0.1,
+                 activation="relu",
+                 batch_normalization=True,
+                 dropout=0.5,
+                 output_activation="linear",
+                 output_dim=None,
+                 output_filter_length=None,
+                 output_directory=None,
+                 **kwargs):
+
+        super(Convolution1DAutoEncoder, self).__init__(output_directory,
+                                                       **kwargs)
+
+        # Construct the model
+        nlayers = len(layer_sizes)
+
+        # Check length of parameter lists
+        activation = self._format_params_nlayers(activation, nlayers)
+        dropout = self._format_params_nlayers(dropout, nlayers)
+
+        # Output parameters defaults to those of the previous layers
+        if output_dim is None:
+            output_dim = input_dim
+        if output_filter_length is None:
+            output_filter_length = input_filter_length
+
+        # Add input noise - need input_shape...
+        # if noise_sigma > 0:
+        #     self.add(GaussianNoise(noise_sigma, input_dim=input_dim))
+
+        # Create all layers
+        n_units, layer_sizes = layer_sizes[0], layer_sizes[1:]
+        input_layer = Convolution1D(n_units,
+                                    input_filter_length,
+                                    border_mode="same",
+                                    input_dim=input_dim,
+                                    **kwargs)
+        output_layer = Convolution1D(output_dim,
+                                     output_filter_length,
+                                     border_mode="same",
+                                     **kwargs)
+        layers = [input_layer]
+        for n_units in layer_sizes:
+            hidden_layer = TimeDistributedDense(n_units, **kwargs)
+            layers.append(hidden_layer)
+
+        for ii, layer in enumerate(layers):
+            self.add(layer)
+            if batch_normalization:
+                self.add(BatchNormalization())
+            self.add(Activation(activation[ii]))
+            if dropout[ii] > 0:
+                self.add(Dropout(dropout[ii]))
+        self.add(output_layer)
+        self.add(Activation(output_activation))
+
+        if self.output_directory is not None:
+            self.save(model_file="init_model.json", weights=False)
+
+
+class RecurrentAutoEncoder(KerasModel):
+
+    def __init__(self, input_dim,
+                 layer_sizes,
+                 noise_sigma=0,
+                 activation="tanh",
+                 batch_normalization=False,
+                 dropout=0,
+                 output_activation=None,
+                 output_dim=None,
+                 output_directory=None,
+                 **kwargs):
+
+
+        super(RecurrentAutoEncoder, self).__init__(output_directory,
+                                                   **kwargs)
+
+        # Construct the model
+        nlayers = len(layer_sizes)
+
+        # Check length of parameter lists
+        activation = self._format_params_nlayers(activation, nlayers)
+        dropout = self._format_params_nlayers(dropout, nlayers)
+
+        if isinstance(input_dim, tuple):
+            input_shape = input_dim
+            input_dim = input_shape[0]
+        else:
+            input_shape = None
+
+        # Output parameters defaults to those of the previous layers
+        if output_dim is None:
+            output_dim = input_dim
+
+        # Add input noise - need input_shape...
+        if noise_sigma > 0:
+            if input_shape is not None:
+                self.add(GaussianNoise(noise_sigma, input_shape=input_shape))
+            else:
+                raise ValueError("If you want to add noise, make sure input_dim is a tuple of the expected input shape")
+
+        # Create all layers
+        n_units, layer_sizes = layer_sizes[0], layer_sizes[1:]
+        input_layer = SimpleRNN(n_units,
+                                return_sequences=True,
+                                input_dim=input_dim,
+                                **kwargs)
+        output_layer = TimeDistributedDense(output_dim,
+                                            **kwargs)
+        layers = [input_layer]
+        for n_units in layer_sizes:
+            hidden_layer = SimpleRNN(n_units,
+                                     return_sequences=True,
+                                     **kwargs)
+            layers.append(hidden_layer)
+
+        for ii, layer in enumerate(layers):
+            self.add(layer)
+            if batch_normalization:
+                self.add(BatchNormalization())
+            self.add(Activation(activation[ii]))
+            if dropout[ii] > 0:
+                self.add(Dropout(dropout[ii]))
+        self.add(output_layer)
+        self.add(Activation(output_activation))
+
+        if self.output_directory is not None:
+            self.save(model_file="init_model.json", weights=False)
+
+
+class StaticAutoEncoder(KerasModel):
+
+    _save_attrs = ["input_dim"]
 
     def __init__(self, **kwargs):
 
-        super(DeepNetwork, self).__init__(**kwargs)
+        super(StaticAutoEncoder, self).__init__(**kwargs)
 
-    def create(self, input_shape,
+    def create(self, input_dim,
                layer_sizes,
                noise_sigma=0.1,
                activation="relu",
@@ -180,22 +313,14 @@ class DeepNetwork(KerasModel):
                loss="mean_squared_error",
                **kwargs):
 
-        if isinstance(input_shape, SoundInput):
-            self.input_shape = input_shape.data.shape
-        elif isinstance(input_shape, np.ndarray):
-            self.input_shape = input_shape.shape
-        elif isinstance(input_shape, (list, tuple)):
-            self.input_shape = input_shape
-        else:
-            raise ValueError("input_shape is of unknown type: %s" % str(type(input_shape)))
-
+        self.input_dim = input_dim
         if isinstance(activation, list):
             if len(activation) != len(layer_sizes):
                 raise ValueError("If activation is a list it must be of the same length as layer sizes")
         else:
             activation = [activation] * len(layer_sizes)
 
-        input_dim = np.prod(self.input_shape)
+        input_dim = np.prod(self.input_dim)
 
         if output_activation is None:
             output_activation = activation
@@ -251,80 +376,48 @@ class DeepNetwork(KerasModel):
         self.model.add(AutoEncoder(encoder, decoder, output_reconstruction=True))
         self.model.compile(loss=loss, optimizer=optimizer)
 
-
-class TimeConvolutionNetwork(DeepNetwork):
-
-    _save_attrs = ["chunk_size", "stride", "input_shape"]
-
-    def __init__(self, chunk_size=None, stride=0.5, **kwargs):
-
-        super(TimeConvolutionNetwork, self).__init__(**kwargs)
-        self.chunk_size = chunk_size
-        self.stride = stride
-        self._input_numbers = None
-        self._input_durations = None
-
-    def create(self, input_shape, *args, **kwargs):
-
-        if isinstance(input_shape, SoundInput):
-            self.input_shape = (input_shape.data.shape[0], self.chunk_size)
-        elif isinstance(input_shape, np.ndarray):
-            self.input_shape = (input_shape.shape[0], self.chunk_size)
-        elif isinstance(input_shape, (list, tuple)):
-            self.input_shape = (input_shape[0], self.chunk_size)
-        else:
-            raise ValueError("input_shape is of unknown type: %s" % str(type(input_shape)))
-
-        super(TimeConvolutionNetwork, self).create(self.input_shape, *args, **kwargs)
-
-
-class TimeDelayConvolutionNetwork(TimeConvolutionNetwork):
-
-    _save_attrs = ["input_size", "stride", "output_size", "output_delay", "input_shape"]
-
-    def __init__(self, input_size=None, stride=0.5, output_size=None, output_delay=0, **kwargs):
-
-        super(TimeDelayConvolutionNetwork, self).__init__(chunk_size=input_size,
-                                                          stride=stride,
-                                                          **kwargs)
-        self.output_delay = output_delay
-        if output_size is None:
-            self.output_size = self.chunk_size
-        else:
-            self.output_size = output_size
-
-    def fit(self, sound_inputs, sound_outputs=None, batch_size=128, **kwargs):
-
-        if isinstance(sound_inputs, list):
-            filename = self.sounds_to_dataset(sound_inputs, sound_outputs=sound_outputs,
-                                              batch_size=batch_size)
-        elif os.path.isfile(sound_inputs):
-            filename = sound_inputs
-        elif self.ds_filename is not None:
-            filename = self.ds_filename
-        else:
-            IOError("No sound inputs file named %s" % sound_inputs)
-
-        with h5py.File(filename, "r") as hf:
-            inputs = hf["input"]
-            outputs = hf["output"]
-            self.model.fit(inputs, outputs, batch_size=batch_size, **kwargs)
-
-    def get_output(self, sound_inputs, layer):
+    def get_encoder_layer(self, layer):
 
         ae = [ll for ll in self.model.layers if isinstance(ll, AutoEncoder)][0]
-        get_feature = theano.function([self.model.layers[0].input],
-                                      ae.encoder.layers[layer].get_output(train=False),
-                                      allow_input_downcast=False)
-        data = self.sounds_to_input(sound_inputs)[0]
+        layers = [ll for ll in ae.encoder.layers if hasattr(ll, "W")]
 
-        return [out for out in get_feature(data)]
+        try:
+            return layers[layer]
+        except IndexError:
+            raise IndexError("Model only has %d encoder layers with weights" % len(layers))
 
-    def predict(self, sound_inputs, stride=None, **kwargs):
+    def get_filters(self, layer_num, input_shape=None):
 
-        data = self.sounds_to_input(sound_inputs, stride=stride)[0]
+        for ii in range(layer_num + 1):
+            ll = self.get_encoder_layer(ii)
+            if ii == 0:
+                filters = ll.get_weights()[0]
+            else:
+                filters = np.dot(filters, ll.get_weights()[0])
+        if input_shape is None:
+            input_shape = filters[:, ii].shape
 
-        print("Testing model")
-        output = self.model.predict(data, **kwargs)
+        return [filters[:, ii].reshape(input_shape) for ii in range(filters.shape[1])]
 
-        return self.output_to_sounds(output)
+    def sample(self, layer_num, mean=None, covariance=None, nsamples=1):
+
+        if mean is None:
+            mean = self.mean
+        if covariance is None:
+            covariance = self.covariance
+
+        ae = [ll for ll in self.model.layers if isinstance(ll, AutoEncoder)][0]
+        input_layer = ae.encoder.layers[layer_num]
+        layers = ae.encoder.layers[layer_num + 1:] + ae.decoder.layers
+        layers = copy.deepcopy(layers)
+
+        new_model = Sequential()
+        # Have to get rid of the "previous" layer for the new first layer
+        delattr(layers[0], "previous")
+        layers[0].set_input_shape((input_layer.ouput_dim,))
+        for ll in layers:
+            new_model.add(ll)
+        new_model.compile(optimizer="sgd", loss="mean_squared_error")
+        data = np.random.multivariate_normal(mean, covariance, nsamples)
+
+        return self.output_to_sounds(new_model.predict(data))

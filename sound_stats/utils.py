@@ -44,6 +44,8 @@ class SlurmRunner(ClusterRunner):
     def run(self, cmdList, **kwargs):
         from slurm_tools import slurm_sbatch
 
+        kwargs.setdefault("mem", "8000")
+        kwargs.setdefault("partition", "regular")
         return slurm_sbatch(cmdList, **kwargs)
 
 

@@ -2,10 +2,12 @@
 
 from __future__ import division, print_function
 import os
+import uuid
 import h5py
 import uuid
 import logging
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.io import wavfile
 from lasp.timefreq import (gaussian_stft, bandpass_timefreq,
@@ -15,21 +17,12 @@ logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-def run_on_cluster(func):
-
-    def split(*args, **kwargs):
-        # Should split all args the same length as the first arg into several batches and run on the cluster
-        # Then start a merge job that depends on the others to run at the very end
-
-        return func(*args, **kwargs)
-
-    return split
-
 class SoundData(object):
 
-    _SAVE_ATTRS = ["chunk_size", "increment"]
+    _SAVE_ATTRS = ["chunk_size", "increment", "vectorize", "_tmp_dir"]
 
-    def __init__(self, filename, batch_size=128, chunk_size=None, increment=None):
+    def __init__(self, filename, batch_size=128, chunk_size=None,
+                 vectorize=False, increment=None):
         """
         Creates an object useful as input to a keras model for studying
         sound statistics. Each subclass of SoundData will define a seperate
@@ -44,60 +37,94 @@ class SoundData(object):
 
         self.filename = filename
         self.batch_size = batch_size
+        self.vectorize = vectorize
+        self.chunk_size = chunk_size
+        if (self.chunk_size is not None) and (increment is None):
+            increment = int(0.5 * self.chunk_size)
+        self.increment = increment
+        self._metadata = None
+        self._tmp_dir = None
+
         if os.path.exists(filename):
             self.load()
         else:
-            with h5py.File(filename):
+            with h5py.File(filename, "w"):
                 pass
-            self.chunk_size = chunk_size
-            if (self.chunk_size is not None) and (increment is None):
-                increment = int(0.5 * self.chunk_size)
-            self.increment = increment
             self.save()
 
     @property
     def X(self):
 
-        if not hasattr(self, "_hf"):
-            self._hf = h5py.File(self.filename, "r")
-        if "data0" in self._hf:
-            return self._hf["data0"]
-        else:
-            self._hf.close()
-            del self._hf
-            return
+        return self.get_data("data0")
 
     @property
     def y(self):
 
-        if not hasattr(self, "_hf"):
-            self._hf = h5py.File(self.filename, "r")
-        if "data1" in self._hf:
-            return self._hf["data1"]
+        y = self.get_data("data1")
+        if y is not None:
+            return y
         else:
             return self.X
+
+    def get_data(self, name):
+
+        if not hasattr(self, "_hf"):
+            self._hf = h5py.File(self.filename, "r")
+        if name in self._hf:
+            return self._hf[name]
+
+    def clear_data(self, name):
+
+        if not hasattr(self, "_hf"):
+            self._hf = h5py.File(self.filename, "a")
+        if name in self._hf:
+            try:
+                del self._hf[name]
+                return True
+            except:
+                return False                    
+
+    @property
+    def metadata(self):
+
+        if self._metadata is None:
+            try:
+                self._metadata = pd.read_hdf(self.filename, "/metadata0")
+            except:
+                self._metadata = pd.DataFrame(dict(filename=[], start=[], nrows=[]))
+
+        return self._metadata
+
+    def close(self):
+
+        if hasattr(self, "_hf"):
+            self._hf.close()
 
     @classmethod
     def load_waveform(cls, waveform, samplerate=16000):
 
         if isinstance(waveform, tuple):
+            filename = list()
             waveform = list(waveform)
             for ii, val in enumerate(waveform):
-                waveform[ii], fs = cls.load_waveform(val, samplerate=samplerate)
+                waveform[ii], fs, fname = cls.load_waveform(val, samplerate=samplerate)
+                filename.append(fname)
         elif isinstance(waveform, str):
+            filename = waveform
             logger.debug("Loading from %s" % waveform)
             fs, waveform = wavfile.read(waveform)
             if len(waveform.shape) > 1:
                 waveform = waveform.mean(axis=1)
         else:
             fs = samplerate
+            filename = None
 
-        return waveform, fs
+        return waveform, fs, filename
 
     def chunk_data(self, data, temporal_offset=0):
 
-        if offset < 0:
-            raise ValueError("offset must be >= 0")
+        if temporal_offset < 0:
+            raise ValueError("temporal_offset must be >= 0")
 
         if self.chunk_size is not None:
             chunks = list()
@@ -107,6 +134,7 @@ class SoundData(object):
 
                 # If the segment extends beyond the duration of the sound,
                 # use just the last full segment that fits
+                # This needs to be stored somewhere though! It's broken as is. or just pad with zeros...
                 if inds[-1] >= duration:
                     inds = range(duration - self.chunk_size, duration)
 
@@ -114,9 +142,35 @@ class SoundData(object):
                 if inds[-1] == (duration - 1):
                     break
         else:
-            chunks = [data.ravel()]
+            if self.vectorize:
+                chunks = [data.ravel()]
+            else:
+                chunks = [data.reshape((1,) + data.shape)]
 
         return np.vstack(chunks)
+
+    def reshape_vector(self, rows):
+        """ Reshape a list of rows into the appropriate representation
+        """
+
+        if not isinstance(rows, list):
+            rows = list(rows)
+
+        if self.chunk_size is not None:
+            nbands = len(rows[0]) / self.chunk_size
+            duration = self.increment * (len(rows) - 1) + self.chunk_size
+            data = np.zeros((nbands, duration))
+            count = np.zeros((nbands, duration))
+            for ii, row in enumerate(rows):
+                start = ii * self.increment
+                data[:, start: start + self.chunk_size] += np.reshape(row, (nbands, self.chunk_size))
+                count[:, start: start + self.chunk_size] += 1
+            data = data / count
+        else:
+            # how do this??
+            pass
+
+        return data
 
     def split(self, waveforms, *args, **kwargs):
         import yaml
@@ -127,8 +181,12 @@ class SoundData(object):
         cluster_params = kwargs.pop("cluster_params", dict())
         samplerate = kwargs.get("samplerate", 16000)
 
-        tmp_dir = get_temporary_directory()
-        os.makedirs(tmp_dir)
+        if self._tmp_dir is None:
+            tmp_dir = get_temporary_directory()
+            os.makedirs(tmp_dir)
+            self._tmp_dir = tmp_dir
+        else:
+            tmp_dir = self._tmp_dir
         logging.debug("Outputting to %s" % tmp_dir)
 
         if (cluster is True) or (cluster == "slurm"):
@@ -136,6 +194,7 @@ class SoundData(object):
             runner = SlurmRunner()
             logger.debug("Running on slurm")
             cluster_params.setdefault("out", os.path.join(tmp_dir, "slurm-%j.out"))
+            cluster_params.setdefault("mem", "8000")
         elif cluster == "savio":
             # map to savio
             logger.debug("Running on savio")
@@ -149,7 +208,8 @@ class SoundData(object):
         njobs = int((len(waveforms) - 1) / num_per) + 1
         for job in range(njobs):
             start = job * num_per
-            yaml_file = os.path.join(tmp_dir, "job_%d.yaml" % job)
+            job_name = str(uuid.uuid4())[:8]
+            yaml_file = os.path.join(tmp_dir, "job_%s.yaml" % job_name)
             arg_dict["inputs"] = dump_wavefiles(waveforms[start: start + num_per],
                                                 tmp_dir,
                                                 sample_rate=samplerate)
@@ -170,11 +230,158 @@ class SoundData(object):
 
     def merge(self, filenames):
 
-        # TODO: If filenames is a directory, load all h5 files from it
-        # TODO: for all filenames, load up dataset and append to objects dataset
-        # TODO: Delete h5 and yaml files for all those added
         # TODO: Alert of any remaining yaml files
-        pass
+
+        if not isinstance(filenames, list):
+            filenames = [filenames]
+
+        h5_files = list()
+        logger.info("Looking at %d filenames for h5 files" % len(filenames))
+        for filename in filenames:
+            if os.path.isdir(filename):
+                filenames.extend(map(lambda ss: os.path.join(filename, ss), os.listdir(filename)))
+            elif os.path.isfile(filename) and filename.endswith(".h5"):
+                h5_files.append(filename)
+
+        nfiles = len(h5_files)
+        logger.info("Found %d h5 files" % nfiles)
+        datasets = list()
+        start = 0
+        logger.info("Opening %s" % self.filename)
+        with h5py.File(self.filename, "a") as hf:
+            for ii, filename in enumerate(h5_files):
+                logger.info("%d of %d) Opening temporary file %s" % (ii, nfiles, filename))
+                metadatas = dict()
+                for jj in range(10):
+                    name = "metadata%d" % jj
+                    try:
+                        metadatas[name] = pd.read_hdf(filename, "/" + name)
+                    except KeyError:
+                        pass
+
+                with h5py.File(filename, "r") as tmp_hf:
+                    # Since it's the first one, open the dataset or create the necessary ones
+                    if ii == 0:
+                        ds_names = [ss for ss in tmp_hf.keys() if ss.startswith("data")]
+                        logger.info("Found %d datasets: %s" % (len(ds_names), ", ".join(ds_names)))
+                        for name in ds_names:
+                            if name not in hf:
+                                data_shape = tmp_hf[name].shape
+                                max_shape = [None] * len(data_shape)
+                                max_shape[-1] = data_shape[-1]
+                                max_shape = tuple(max_shape)
+                                logger.info("Creating dataset %s" % name)
+                                ds = hf.create_dataset(name,
+                                                       data_shape,
+                                                       maxshape=max_shape)
+                            else:
+                                ds = hf[name]
+                                start = hf[name].shape[0]
+                                logger.info("Found dataset named %s. Starting at row %d" % (name, start))
+                            datasets.append(ds)
+
+                    logger.info("Appending datasets")
+                    for name, ds in zip(ds_names, datasets):
+                        if name not in tmp_hf:
+                            logger.warning("No dataset named %s in %s. Skipping." % (name, filename))
+                            break
+                        output = tmp_hf[name]
+                        start = ds.shape[0]
+                        nrows = output.shape[0]
+                        ds.resize(start + nrows, 0)
+                        for jj in range(1, len(output.shape) - 1):
+                            if ds.shape[jj] < output.shape[jj]:
+                                ds.resize(output.shape[jj], jj)
+                        ds[start: start+nrows] = output
+
+                        metadata_name = name.replace("data", "metadata")
+                        tmp_metadata = metadatas[metadata_name]
+
+                        # Add start to tmp_metadata index
+                        tmp_metadata = tmp_metadata.reset_index()
+                        tmp_metadata["start"] = tmp_metadata["start"] + start
+                        tmp_metadata = tmp_metadata.set_index("start")
+
+                        # Output to the hdf5 file
+                        tmp_metadata.to_hdf(self.filename, metadata_name,
+                                            format="table", append=True,
+                                            min_itemsize=200)
+
+                # Delete filename and corresponding .yaml file
+                # logger.info("Removing .h5 and .yaml files")
+                # os.remove(filename)
+                # os.remove(filename.replace(".h5", ".yaml"))
+
+    def store_data(self, data_list, filenames=None):
+        """ Store the data in a dataset
+        :param data_list: a list of data arrays to store
+        """
+
+        if filenames is None:
+            filenames = [None] * len(data_list)
+
+        metadatas = list()
+        metadata = dict(filename=None,
+                        start=0,
+                        nrows=0)
+
+        with h5py.File(self.filename, "a") as hf:
+            ds_names = [ss for ss in hf.keys() if ss.startswith("data")]
+            if (len(data_list) > len(ds_names)) and (len(ds_names) > 0):
+                raise ValueError("%d datasets in the file %s, but you passed %d data arrays" % (len(ds_names), self.filename, len(data_list)))
+
+            for ii, data in enumerate(data_list):
+                if self.chunk_size is not None:
+                    data = self.chunk_data(data)
+                    if len(data.shape) == 1:
+                        data = data.reshape((1, -1))
+                else:
+                    data = data.reshape((1,) + data.shape)
+
+                ds_name = "data%d" % ii
+                if ds_name not in hf:
+                    # Create a chunked dataset. The shape of the dataset should
+                    # be whatever is in data. The maxshape should be fungible,
+                    # except for the number of features (e.g. frequency bands)
+                    # The chunk shape can be configured automatically
+                    max_shape = [None] * len(data.shape)
+                    max_shape[-1] = data.shape[-1]
+                    max_shape = tuple(max_shape)
+                    ds = hf.create_dataset(ds_name,
+                                           data.shape,
+                                           maxshape=max_shape)
+                else:
+                    ds = hf[ds_name]
+                    if data.shape[-1] != ds.shape[-1]:
+                        raise ValueError("Data array %d has %d features but should have %d features" % (ii, data.shape[-1], ds.shape[-1]))
+
+
+                start = ds.shape[0]
+                nrows = data.shape[0]
+                ds.resize(start + nrows, 0)
+                for jj in range(1, len(data.shape) - 1):
+                    logger.debug("Checking index %d for resizing" % jj)
+                    if ds.shape[jj] < data.shape[jj]:
+                        ds.resize(data.shape[jj], jj)
+                        logger.debug("Resizing ds from %s to %s" % (ds.shape, data.shape))
+                ds[start: start+nrows] = data
+                if isinstance(filenames, (list, tuple)):
+                    if len(filenames) <= ii:
+                        filename = None
+                    else:
+                        filename = filenames[ii]
+                else:
+                    filename = filenames
+                metadata["filename"] = filename
+                metadata["start"] = start
+                metadata["nrows"] = nrows
+
+                metadatas.append(pd.DataFrame(metadata, index=[0]))
+
+        for ii, metadata in enumerate(metadatas):
+            metadata = metadata.set_index("start")
+            metadata.to_hdf(self.filename, "/metadata%d" % ii,
+                            format="table", append=True, min_itemsize=200)
 
     def compute_and_store(self, waveforms, *args, **kwargs):
         """
@@ -186,14 +393,14 @@ class SoundData(object):
         """
 
         samplerate = kwargs.pop("samplerate", 16000)
-        offset = kwargs.pop("offset", 0)
+        temporal_offset = kwargs.pop("temporal_offset", 0)
         # append = kwargs.pop("append", False)
         append = False
         start = 0
         with h5py.File(self.filename, "a") as hf:
             logger.info("Starting loop through %d waveforms" % len(waveforms))
             for ii, waveform in enumerate(waveforms):
-                waveform, fs = self.load_waveform(waveform, samplerate)
+                waveform, fs, filename = self.load_waveform(waveform, samplerate)
                 kwargs["samplerate"] = fs
                 logger.info("%d) Computing transform" % ii)
                 outputs = self.compute(waveform, *args, **kwargs)
@@ -202,29 +409,9 @@ class SoundData(object):
                     outputs = list(outputs)
                 else:
                     outputs = [outputs]
+                    filename = [filename]
 
-                if ii == 0:
-                    datasets = list()
-                    for jj, output in enumerate(outputs):
-                        if self.chunk_size is None:
-                            ncols = np.prod(output.shape)
-                        else:
-                            ncols = output.shape[0] * self.chunk_size
-                        ds = hf.create_dataset("data%d" % jj,
-                                               (1, ncols),
-                                               maxshape=(None, ncols),
-                                               chunks=(self.batch_size, ncols))
-                        datasets.append(ds)
-
-                for ds, output in zip(datasets, outputs):
-                    output = self.chunk_data(output, offset=offset)
-                    nrows = output.shape[0]
-                    ds.resize(start + nrows, 0)
-                    ds[start: start+nrows] = output
-
-                start += nrows
-
-        return datasets
+                self.store_data(outputs, filenames=filename)
 
     def load(self):
         """
@@ -261,8 +448,7 @@ class Spectrogram(SoundData):
         self.frequencies = None
         self.time = None
 
-    def compute(self, waveform, window_length=window_length,
-                increment=increment, samplerate=16000,
+    def compute(self, waveform, window_length, increment, samplerate=16000,
                 min_freq=0, max_freq=None, nstd=6, offset=50):
 
         self.time, self.frequencies, spec = gaussian_stft(waveform,
@@ -272,14 +458,14 @@ class Spectrogram(SoundData):
                                                           min_freq=min_freq,
                                                           max_freq=max_freq,
                                                           nstd=nstd)[:3]
-        return log_spectrogram(np.abs(spec), offset=offset)
+        return log_spectrogram(np.abs(spec), offset=offset).T
 
     def plot(self, data=None):
 
         if data is None:
             data = self.data
 
-        plt.imshow(data,
+        plt.imshow(data.T,
                    aspect="auto",
                    origin="lower",
                    extent=[self.time[0], self.time[-1],
@@ -302,9 +488,9 @@ class MeanCenterSpectrogram(Spectrogram):
     def compute(self, *args, **kwargs):
 
         output = super(MeanCenterSpectrogram, self).compute(*args, **kwargs)
-        self.mean = np.mean(output, axis=1)
+        self.mean = np.mean(output, axis=0)
 
-        return output - self.mean.reshape(-1, 1)
+        return output - self.mean
 
 
 class RatioMask(SoundData):
@@ -320,9 +506,7 @@ class RatioMask(SoundData):
         self.time = None
         super(RatioMask, self).__init__(*args, **kwargs)
 
-    def compute(self, waveforms, window_length=window_length,
-                increment=increment, samplerate=16000,
-                min_freq=0, max_freq=None, nstd=6, offset=50):
+    def compute(self, waveforms, window_length, increment, samplerate=16000, min_freq=0, max_freq=None, nstd=6, offset=50):
 
         signal, stimulus = waveforms
 
@@ -342,9 +526,10 @@ class RatioMask(SoundData):
                                   nstd=nstd)[2]
 
         ratio_mask = np.abs(spec) ** self.alpha / np.abs(stim_spec) ** self.alpha
-        stim_spec = log_spectrogram(stim_spec, offset=offset)
-        self.mean = np.mean(stim_spec, axis=1)
-        stim_spec -= self.mean.reshape(-1, 1)
+        ratio_mask = np.maximum(0, np.minimum(1, ratio_mask)).T
+        stim_spec = log_spectrogram(np.abs(stim_spec), offset=offset).T
+        self.mean = np.mean(stim_spec, axis=0)
+        stim_spec -= self.mean
 
         return stim_spec, ratio_mask
 
