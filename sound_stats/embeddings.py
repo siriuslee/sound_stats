@@ -139,13 +139,6 @@ class KerasModel(Sequential):
             if weights:
                 self.save_weights(weights_file, overwrite=overwrite)
 
-    def get_config(self, *args, **kwargs):
-
-        config = super(KerasModel, self).get_config(*args, **kwargs)
-        config["name"] = "Sequential"
-
-        return config
-
     @staticmethod
     def _format_params_nlayers(param, nlayers):
 
@@ -159,11 +152,36 @@ class KerasModel(Sequential):
 
 
 class Convolution1DAutoEncoder(KerasModel):
+    """ Create a convolutional auto-encoder along the time-dimension
+
+    Parameters
+    ----------
+    input_dim: int
+        The number of units in the input dimension (e.g. # of frequency bands)
+    layer_sizes: list
+        The number of units in each hidden layer
+    input_filter_length: int
+        The duration of the temporal kernels
+    noise_sigma: float
+        Standard deviation for the gaussian noise to add to the input
+    activation: string, Activation or list of strings/Activations
+        The activation function for each layer. Can be the same for all or a list with as many elements as hidden layers.
+    batch_normalization: bool
+        Whether or not to perform batch normalization
+    dropout: float or list of floats
+        Fraction of units to drop out. Can be given for all layers or a list with as many elements as hidden layers
+    output_dim: int
+        The number of units in the output. Defaults to input_dim
+    output_filter_length: int
+        Duration of the output temporal kernel
+    output_directory: string
+        A directory in which to store the initial model configuration file
+    """
 
     def __init__(self, input_dim,
                  layer_sizes,
                  input_filter_length,
-                 noise_sigma=0.1,
+                 noise_sigma=0.0,
                  activation="relu",
                  batch_normalization=True,
                  dropout=0.5,

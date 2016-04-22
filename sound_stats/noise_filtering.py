@@ -195,17 +195,42 @@ class NoiseFilterSounds(sound_input.SoundData):
 
 
 class NoiseFilterNetwork(embeddings.Convolution1DAutoEncoder):
+    """ Create a convolutional auto-encoder along the time-dimension
 
+    Parameters
+    ----------
+    input_dim: int
+        The number of units in the input dimension (e.g. # of frequency bands)
+    layer_sizes: list
+        The number of units in each hidden layer
+    input_filter_length: int
+        The duration of the temporal kernels
+    noise_sigma: float
+        Standard deviation for the gaussian noise to add to the input
+    activation: string, Activation or list of strings/Activations
+        The activation function for each layer. Can be the same for all or a list with as many elements as hidden layers.
+    batch_normalization: bool
+        Whether or not to perform batch normalization
+    dropout: float or list of floats
+        Fraction of units to drop out. Can be given for all layers or a list with as many elements as hidden layers
+    output_dim: int
+        The number of units in the output. Defaults to input_dim
+    output_filter_length: int
+        Duration of the output temporal kernel
+    output_directory: string
+        A directory in which to store the initial model configuration file
+    """
     def __init__(self, input_dim,
                  layer_sizes,
                  input_filter_length,
-                 noise_sigma=0.1,
+                 noise_sigma=0.0,
                  activation="relu",
                  batch_normalization=True,
                  dropout=0.0,
                  output_activation="sigmoid",
                  output_dim=None,
                  output_filter_length=None,
+                 output_directory=None,
                  **kwargs):
 
         super(NoiseFilterNetwork, self).__init__(input_dim,
@@ -218,9 +243,15 @@ class NoiseFilterNetwork(embeddings.Convolution1DAutoEncoder):
                                                  output_activation=output_activation,
                                                  output_dim=output_dim,
                                                  output_filter_length=output_filter_length,
+                                                 output_directory=output_directory,
                                                  **kwargs)
 
     def filter_noise(self, stimulus_spec, filterbank):
+
+        if stimulus_spec.ndim == 2:
+            stimulus_spec = stimulus_spec.reshape((1,) + stimulus_spec.shape)
+        if filterbank.ndim == 2:
+            filterbank = filterbank.reshape((1,) + filterbank.shape)
 
         n = int(filterbank.shape[1] / stimulus_spec.shape[1])
         input_shape = stimulus_spec.shape[1:]

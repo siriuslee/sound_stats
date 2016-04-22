@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from scipy.io import wavfile
 from lasp.timefreq import (gaussian_stft, bandpass_timefreq,
                            define_f_bands, log_spectrogram)
+from keras.utils.io_utils import HDF5Matrix
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -66,12 +67,13 @@ class SoundData(object):
         else:
             return self.X
 
-    def get_data(self, name):
+    def get_data(self, name, start=0, stop=None):
 
-        if not hasattr(self, "_hf"):
-            self._hf = h5py.File(self.filename, "r")
-        if name in self._hf:
-            return self._hf[name]
+        if stop is None:
+            with h5py.File(self.filename, "r") as hf:
+                stop = len(hf[name])
+
+        return HDF5Matrix(self.filename, name, start, stop)
 
     def clear_data(self, name):
 
@@ -82,7 +84,7 @@ class SoundData(object):
                 del self._hf[name]
                 return True
             except:
-                return False                    
+                return False
 
     @property
     def metadata(self):
